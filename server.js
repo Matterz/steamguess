@@ -3,7 +3,6 @@
 
 const express = require('express');
 const path = require('path');
-const cors = require('cors');
 
 // Use Node 18+ global fetch if available; otherwise lazy-load node-fetch
 const fetchAny = typeof fetch === 'function'
@@ -13,7 +12,6 @@ const fetchAny = typeof fetch === 'function'
 const app = express();
 const root = __dirname;
 
-// ---- CORS: allow dev (localhost:3000) and your production site(s) ----
 const cors = require('cors');
 
 // Put your Bluehost domain(s) here
@@ -35,6 +33,7 @@ app.use(cors({
   },
   methods: ['GET'],
 }));
+/* --------------------------------------------------------- */
 
 // Serve any local assets you might keep on Render (optional)
 app.use(express.static(root));
@@ -84,4 +83,3 @@ const PORT = process.env.PORT || 5500;
 app.listen(PORT, () => {
   console.log(`Render API listening on http://localhost:${PORT}`);
 });
-
