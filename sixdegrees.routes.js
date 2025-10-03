@@ -1,45 +1,82 @@
-// sixdegrees.routes.js — robust tag -> candidates with multi-tier fallbacks
+// sixdegrees.routes.js — only "game" results + diversified "similar"
 // deps: jsdom
 
 const express = require('express');
 const { JSDOM } = require('jsdom');
 
 const router = express.Router();
-const UA = 'SixDegreesSteam/1.2 (+stream)';
+const UA = 'SixDegreesSteam/1.3 (+stream)';
 
-// Use Node 18 global fetch if present; else lazy-load node-fetch
 const fetchAny = typeof fetch === 'function'
   ? fetch
   : (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
+/* -------------------- caches -------------------- */
 const cache = {
-  tagHtml: new Map(),   // tag -> html
-  app: new Map(),       // appid -> {appid,name,header_image,year,tags}
-  moreLike: new Map(),  // appid -> [neighbor ids]
+  tagHtml: new Map(),
+  app: new Map(),        // appid -> details
+  moreLike: new Map(),   // appid -> [ids]
 };
 
-/* --------------------- App + Similar --------------------- */
+/* -------------------- helpers -------------------- */
+function uniq(arr) { return [...new Set(arr)]; }
+
+function isGameDetails(d) {
+  const t = (d?.type || '').toLowerCase();
+  if (t && t !== 'game') return false;                     // DLC, demo, mod, soundtrack, app, video...
+  const name = (d?.name || '').toLowerCase();
+  if (/soundtrack|demo|beta/.test(name)) return false;
+  // Some titles don’t mark type reliably; look at categories/genres
+  const badCats = ['Downloadable Content', 'Demo'];
+  const tags = [
+    ...(d?.genres?.map(g => g.description) || []),
+    ...(d?.categories?.map(c => c.description) || []),
+  ];
+  if (tags.some(t => badCats.includes(t))) return false;
+  return true;
+}
+
+function normalizeTags(d) {
+  const tags = [
+    ...(d?.genres?.map(g => g.description) || []),
+    ...(d?.categories?.map(c => c.description) || []),
+  ].map(s => (s || '').toLowerCase());
+  return uniq(tags);
+}
+
+function jaccard(a, b) {
+  if (!a.size && !b.size) return 0;
+  let inter = 0;
+  for (const x of a) if (b.has(x)) inter++;
+  return inter / (a.size + b.size - inter || 1);
+}
+
+/* -------------------- app details -------------------- */
 async function getAppDetails(appid) {
   if (cache.app.has(appid)) return cache.app.get(appid);
   const url = `https://store.steampowered.com/api/appdetails?appids=${appid}&l=english`;
   const r = await fetchAny(url, { headers: { 'User-Agent': UA } });
   const j = await r.json();
   const d = j?.[appid]?.data || {};
+  if (!isGameDetails(d)) { // cache negative too to avoid refetch loops
+    cache.app.set(appid, null);
+    return null;
+  }
   const year = parseInt((d.release_date?.date || '').match(/\b(\d{4})\b/)?.[1]) || undefined;
   const out = {
     appid,
+    type: (d.type || '').toLowerCase(),
     name: d.name,
     header_image: d.header_image || d.capsule_image || d.capsule_imagev5 || '',
     year,
-    tags: (d.genres?.map(g => g.description) || [])
-      .concat(d.categories?.map(c => c.description) || [])
-      .slice(0, 10),
+    tags: normalizeTags(d),
   };
-  if (out.name) cache.app.set(appid, out);
+  cache.app.set(appid, out);
   return out;
 }
 
-async function moreLike(appid, cap = 12) {
+/* -------------------- more like this -------------------- */
+async function moreLikeIds(appid, cap = 60) {
   if (cache.moreLike.has(appid)) return cache.moreLike.get(appid).slice(0, cap);
   const url = `https://store.steampowered.com/recommended/morelike/app/${appid}?l=english`;
   const r = await fetchAny(url, { headers: { 'User-Agent': UA } });
@@ -55,7 +92,7 @@ async function moreLike(appid, cap = 12) {
   return ids.slice(0, cap);
 }
 
-/* --------------------- Tag page (primary) --------------------- */
+/* -------------------- tag page + fallbacks -------------------- */
 async function fetchTagHtml(tag) {
   const key = tag.toLowerCase();
   if (cache.tagHtml.has(key)) return cache.tagHtml.get(key);
@@ -75,23 +112,19 @@ function extractSection(dom, title) {
   for (let i = 0; i < 4 && wrap; i++, wrap = wrap.nextElementSibling) {
     const as = [...wrap.querySelectorAll('a[href*="/app/"]')];
     const ids = as.map(a => a.href.match(/\/app\/(\d+)/)?.[1]).filter(Boolean);
-    if (ids.length) return [...new Set(ids)];
+    if (ids.length) return uniq(ids);
   }
   return [];
 }
 
-/* --------------------- Fallback A: Search JSON --------------------- */
-/**
- * Steam search returns JSON with `results_html` (server-rendered snippets).
- * Adding headers like X-Requested-With makes it more reliable.
- */
+// Search JSON fallback
 async function searchByTerm(term, count = 80) {
   const params = new URLSearchParams({
     term,
     count: String(count),
     start: '0',
     supportedlang: 'english',
-    category1: '998', // games only
+    category1: '998',
     ndl: '1',
     json: '1',
     cc: 'US',
@@ -121,17 +154,9 @@ async function searchByTerm(term, count = 80) {
   return ids;
 }
 
-/* --------------------- Fallback B: StoreSearch API --------------------- */
-/**
- * A simpler JSON API used by the store’s search box.
- * https://store.steampowered.com/api/storesearch/?term=roguelike&l=english&cc=US
- */
+// StoreSearch fallback
 async function storeSearch(term, count = 80) {
-  const params = new URLSearchParams({
-    term,
-    l: 'english',
-    cc: 'US',
-  });
+  const params = new URLSearchParams({ term, l: 'english', cc: 'US' });
   const url = `https://store.steampowered.com/api/storesearch/?${params.toString()}`;
   const r = await fetchAny(url, { headers: { 'User-Agent': UA } });
   const j = await r.json().catch(() => ({}));
@@ -145,52 +170,48 @@ async function storeSearch(term, count = 80) {
   return ids;
 }
 
-/* --------------------- Tag -> Candidates --------------------- */
 async function tagCandidates(tag, limit = 10) {
-  // 1) Try tag page sections
+  // 1) try tag sections
   try {
     const html = await fetchTagHtml(tag);
     const dom = new JSDOM(html);
-    const s1 = extractSection(dom, 'New & Trending').slice(0, 6);
-    const s2 = extractSection(dom, 'Top Sellers').slice(0, 6);
-    const s3 = extractSection(dom, 'Top Rated').slice(0, 6);
-    let ids = [...new Set([...s1, ...s2, ...s3])];
+    const s1 = extractSection(dom, 'New & Trending').slice(0, 12);
+    const s2 = extractSection(dom, 'Top Sellers').slice(0, 12);
+    const s3 = extractSection(dom, 'Top Rated').slice(0, 12);
+    let ids = uniq([...s1, ...s2, ...s3]);
     if (ids.length) {
-      ids.sort(() => Math.random() - 0.5);
-      const games = await Promise.all(ids.slice(0, Math.max(limit, 12)).map(getAppDetails));
-      const clean = games.filter(g => g && g.name).slice(0, limit);
-      if (clean.length) return clean;
+      const games = (await Promise.all(ids.map(getAppDetails))).filter(Boolean);
+      const clean = games.filter(g => (g.type || 'game') === 'game').slice(0, limit);
+      if (clean.length >= limit) return clean;
+      // fall through and top-up
+      const have = new Set(clean.map(g => String(g.appid)));
+      ids = ids.filter(id => !have.has(String(id)));
+      const extra = (await Promise.all(ids.map(getAppDetails))).filter(Boolean);
+      return uniq([...clean, ...extra]).slice(0, limit);
     }
-  } catch (e) {
-    // continue to fallback
-  }
+  } catch {}
 
-  // 2) Fallback A: Search JSON
+  // 2) search fallbacks
   try {
-    let ids = await searchByTerm(tag, 80);
-    ids = ids.slice(0, Math.max(limit, 12));
-    const games = await Promise.all(ids.map(getAppDetails));
-    const clean = games.filter(g => g && g.name).slice(0, limit);
-    if (clean.length) return clean;
-  } catch (e) {
-    // continue to fallback
-  }
+    const ids = await searchByTerm(tag, 120);
+    const games = (await Promise.all(ids.map(getAppDetails))).filter(Boolean);
+    const clean = games.filter(g => (g.type || 'game') === 'game').slice(0, limit);
+    if (clean.length >= limit) return clean;
+  } catch {}
 
-  // 3) Fallback B: StoreSearch API
   try {
-    let ids = await storeSearch(tag, 80);
-    ids = ids.slice(0, Math.max(limit, 12));
-    const games = await Promise.all(ids.map(getAppDetails));
-    const clean = games.filter(g => g && g.name).slice(0, limit);
-    if (clean.length) return clean;
-  } catch (e) {
-    // give up
-  }
+    const ids = await storeSearch(tag, 120);
+    const games = (await Promise.all(ids.map(getAppDetails))).filter(Boolean);
+    const clean = games.filter(g => (g.type || 'game') === 'game').slice(0, limit);
+    return clean;
+  } catch {}
 
-  return []; // no matches
+  return [];
 }
 
-/* --------------------- Slices & Routes --------------------- */
+/* -------------------- routes -------------------- */
+
+// Tags list (unchanged)
 const TAG_SLICES = [
   'Farming Sim','City Builder','Roguelike','Puzzle','Horror','Souls-like',
   'VR','Racing','Sports','Strategy','Platformer','Life Sim',
@@ -200,11 +221,12 @@ router.get('/api/six/slices', (req, res) => {
   res.json({ slices: TAG_SLICES });
 });
 
+// Tag -> games (ONLY games)
 router.get('/api/six/tag', async (req, res) => {
   try {
     const { tag, limit = 10 } = req.query;
     if (!tag) return res.status(400).json({ error: 'missing_tag' });
-    const games = await tagCandidates(tag, +limit);
+    const games = await tagCandidates(tag, +limit || 10);
     res.json({ games });
   } catch (e) {
     console.error('TAG route error:', e);
@@ -212,11 +234,67 @@ router.get('/api/six/tag', async (req, res) => {
   }
 });
 
+/**
+ * Similar -> diversified games
+ * Query params:
+ *   ?exclude=123,456   (appid list to remove — e.g., the chain so far)
+ *   ?limit=10
+ *   ?max_overlap=0.85  (drop items with Jaccard >= max_overlap)
+ *   ?prefer_diverse=1  (sort ascending by overlap; default 1)
+ */
 router.get('/api/six/similar/:appid', async (req, res) => {
   try {
-    const ids = await moreLike(req.params.appid, 12);
-    const games = await Promise.all(ids.slice(0, 10).map(getAppDetails));
-    res.json({ games });
+    const src = String(req.params.appid);
+    const limit = Math.max(1, Math.min(20, parseInt(req.query.limit || '10', 10)));
+    const preferDiverse = String(req.query.prefer_diverse || '1') !== '0';
+    const maxOverlap = Math.min(0.99, Math.max(0.0, parseFloat(req.query.max_overlap || '0.85')));
+
+    const exclude = new Set(
+      (req.query.exclude || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .concat(src) // always exclude the source itself
+    );
+
+    // source tags
+    const srcDetails = await getAppDetails(src);
+    const srcTagSet = new Set(srcDetails?.tags || []);
+
+    // fetch a generous pool
+    let ids = await moreLikeIds(src, 80);
+
+    // resolve details & clean to "games" only
+    let metas = (await Promise.all(ids.map(getAppDetails))).filter(Boolean);
+    metas = metas.filter(m => !exclude.has(String(m.appid)));
+
+    // diversity filter: drop exact/super-high-overlap
+    const scored = metas.map(m => {
+      const set = new Set(m.tags || []);
+      return { meta: m, overlap: jaccard(srcTagSet, set) };
+    });
+
+    const filtered = scored
+      .filter(x => x.overlap < maxOverlap)   // don’t keep ultra-similar
+      .sort((a, b) => (preferDiverse ? a.overlap - b.overlap : 0))
+      .map(x => x.meta);
+
+    // If we filtered too hard, fall back to the original metas (still excluding)
+    const pickFrom = filtered.length >= limit ? filtered : metas;
+
+    // De-dup by name as a last guard (sometimes same game appears with minor variants)
+    const seenNames = new Set();
+    const out = [];
+    for (const m of pickFrom) {
+      const key = (m.name || '').toLowerCase().trim();
+      if (!seenNames.has(key)) {
+        seenNames.add(key);
+        out.push(m);
+      }
+      if (out.length >= limit) break;
+    }
+
+    res.json({ games: out });
   } catch (e) {
     console.error('SIMILAR route error:', e);
     res.status(500).json({ error: e.message });
