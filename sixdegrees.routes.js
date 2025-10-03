@@ -1,5 +1,5 @@
 // sixdegrees.routes.js — robust tag -> candidates (with fallback)
-// deps: jsdom (already installed)
+// deps: jsdom
 
 const express = require('express');
 const { JSDOM } = require('jsdom');
@@ -18,7 +18,6 @@ const cache = {
   moreLike: new Map(),  // appid -> [neighbor ids]
 };
 
-/* ------------ helpers: app details & "more like this" ------------ */
 async function getAppDetails(appid) {
   if (cache.app.has(appid)) return cache.app.get(appid);
   const url = `https://store.steampowered.com/api/appdetails?appids=${appid}&l=english`;
@@ -55,7 +54,6 @@ async function moreLike(appid, cap = 12) {
   return ids.slice(0, cap);
 }
 
-/* ------------ helpers: tag page + search fallback ------------ */
 async function fetchTagHtml(tag) {
   const key = tag.toLowerCase();
   if (cache.tagHtml.has(key)) return cache.tagHtml.get(key);
@@ -80,23 +78,20 @@ function extractSection(dom, title) {
   return [];
 }
 
-// NEW: fallback using Steam Search JSON (returns HTML snippets)
-// We search by the tag text; not perfect, but reliably returns popular matches
-async function searchByTerm(term, count = 60) {
+// Fallback: Steam Search JSON returns HTML snippets we can parse for appids
+async function searchByTerm(term, count = 80) {
   const params = new URLSearchParams({
-    term, // use tag string as a generic query
+    term,
     count: String(count),
     start: '0',
     supportedlang: 'english',
-    category1: '998',    // games only
+    category1: '998', // games only
     ndl: '1',
-    sort_by: '_ASC',     // leave unsorted to let Steam decide
     json: '1',
   });
   const url = `https://store.steampowered.com/search/results/?${params.toString()}`;
   const r = await fetchAny(url, { headers: { 'User-Agent': UA } });
   const j = await r.json().catch(async () => {
-    // Some edges return text/plain; try to parse
     const t = await r.text();
     try { return JSON.parse(t); } catch { return { results_html: '' }; }
   });
@@ -115,35 +110,28 @@ async function tagCandidates(tag, limit = 10) {
   const html = await fetchTagHtml(tag);
   const dom = new JSDOM(html);
 
-  // Try sections from the tag page first
   const s1 = extractSection(dom, 'New & Trending').slice(0, 6);
   const s2 = extractSection(dom, 'Top Sellers').slice(0, 6);
   const s3 = extractSection(dom, 'Top Rated').slice(0, 6);
   let ids = [...new Set([...s1, ...s2, ...s3])];
 
-  // FALLBACK: if empty (common for some tags), use search by term
   if (ids.length === 0) {
     const found = await searchByTerm(tag, 80);
-    ids = found.slice(0, Math.max(limit, 12)); // keep a decent pool
+    ids = found.slice(0, Math.max(limit, 12));
   }
 
-  // Shuffle a bit and trim
   ids.sort(() => Math.random() - 0.5);
   ids = ids.slice(0, Math.max(limit, 12));
 
-  // Resolve details
   const games = await Promise.all(ids.map(getAppDetails));
-  // Filter out bad fetches
   return games.filter(g => g && g.name).slice(0, limit);
 }
 
-/* ------------ wheel slices (hidden to users) ------------ */
 const TAG_SLICES = [
   'Farming Sim','City Builder','Roguelike','Puzzle','Horror','Souls-like',
   'VR','Racing','Sports','Strategy','Platformer','Life Sim',
 ];
 
-/* ------------------- routes ------------------- */
 router.get('/api/six/slices', (req, res) => {
   res.json({ slices: TAG_SLICES });
 });
