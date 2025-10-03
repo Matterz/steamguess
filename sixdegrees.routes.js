@@ -241,6 +241,7 @@ router.get('/api/six/tag', async (req, res) => {
  *   ?limit=10
  *   ?max_overlap=0.85  (drop items with Jaccard >= max_overlap)
  *   ?prefer_diverse=1  (sort ascending by overlap; default 1)
+ *   ?goal=YYYY         (if present in pool, NEVER filter it out; promote to front)
  */
 router.get('/api/six/similar/:appid', async (req, res) => {
   try {
@@ -248,6 +249,7 @@ router.get('/api/six/similar/:appid', async (req, res) => {
     const limit = Math.max(1, Math.min(20, parseInt(req.query.limit || '10', 10)));
     const preferDiverse = String(req.query.prefer_diverse || '1') !== '0';
     const maxOverlap = Math.min(0.99, Math.max(0.0, parseFloat(req.query.max_overlap || '0.85')));
+    const goalId = req.query.goal ? String(req.query.goal) : null;
 
     const exclude = new Set(
       (req.query.exclude || '')
@@ -262,27 +264,55 @@ router.get('/api/six/similar/:appid', async (req, res) => {
     const srcTagSet = new Set(srcDetails?.tags || []);
 
     // fetch a generous pool
-    let ids = await moreLikeIds(src, 80);
+    let ids = await moreLikeIds(src, 120);
 
     // resolve details & clean to "games" only
     let metas = (await Promise.all(ids.map(getAppDetails))).filter(Boolean);
+
+    // Pull out goal meta if it exists in the pool (and do NOT exclude it)
+    let goalMeta = null;
+    if (goalId) {
+      goalMeta = metas.find(m => String(m.appid) === goalId) || null;
+    }
+
+    // exclude everything else as requested
     metas = metas.filter(m => !exclude.has(String(m.appid)));
 
-    // diversity filter: drop exact/super-high-overlap
+    // score by tag-diversity
     const scored = metas.map(m => {
       const set = new Set(m.tags || []);
       return { meta: m, overlap: jaccard(srcTagSet, set) };
     });
 
-    const filtered = scored
-      .filter(x => x.overlap < maxOverlap)   // don’t keep ultra-similar
-      .sort((a, b) => (preferDiverse ? a.overlap - b.overlap : 0))
-      .map(x => x.meta);
+    // filter ultra-similar — BUT NEVER drop the goal if present
+    let filtered = scored.filter(x => {
+      if (goalMeta && String(x.meta.appid) === String(goalMeta.appid)) return true;
+      return x.overlap < maxOverlap;
+    });
 
-    // If we filtered too hard, fall back to the original metas (still excluding)
-    const pickFrom = filtered.length >= limit ? filtered : metas;
+    // sort for diversity (lower overlap first), keeping goal (if any) at the front later
+    if (preferDiverse) {
+      filtered.sort((a, b) => a.overlap - b.overlap);
+    }
 
-    // De-dup by name as a last guard (sometimes same game appears with minor variants)
+    // convert back to metas
+    let pickFrom = filtered.map(x => x.meta);
+
+    // If goal existed, move it to the very front (and dedup)
+    if (goalMeta) {
+      pickFrom = [goalMeta, ...pickFrom.filter(m => String(m.appid) !== String(goalMeta.appid))];
+    }
+
+    // Last-ditch fallback if filtering was too aggressive
+    if (pickFrom.length < limit) {
+      const pool = metas.map(x => x.meta || x); // original metas (already excluded)
+      for (const m of pool) {
+        if (!pickFrom.find(p => String(p.appid) === String(m.appid))) pickFrom.push(m);
+        if (pickFrom.length >= limit) break;
+      }
+    }
+
+    // Dedup by name as a last guard
     const seenNames = new Set();
     const out = [];
     for (const m of pickFrom) {
