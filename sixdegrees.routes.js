@@ -76,7 +76,7 @@ async function getAppDetails(appid) {
 }
 
 /* -------------------- more like this -------------------- */
-async function moreLikeIds(appid, cap = 60) {
+async function moreLikeIds(appid, cap = 200) {
   if (cache.moreLike.has(appid)) return cache.moreLike.get(appid).slice(0, cap);
   const url = `https://store.steampowered.com/recommended/morelike/app/${appid}?l=english`;
   const r = await fetchAny(url, { headers: { 'User-Agent': UA } });
@@ -263,8 +263,20 @@ router.get('/api/six/similar/:appid', async (req, res) => {
     const srcDetails = await getAppDetails(src);
     const srcTagSet = new Set(srcDetails?.tags || []);
 
-    // fetch a generous pool
-    let ids = await moreLikeIds(src, 120);
+    // fetch a generous pool and lightly expand it (one hop) for variety
+	let ids = await moreLikeIds(src, 200);
+
+	// Add one-hop neighbors from the first few results to diversify the pool
+	try {
+	  const seed = ids.slice(0, 6); // crawl a handful only (cheap)
+	  const hopLists = await Promise.all(seed.map(id => moreLikeIds(id, 60)));
+	  for (const list of hopLists) {
+		for (const id of list) {
+		  if (!ids.includes(id)) ids.push(id);
+		}
+	  }
+	} catch (_) { /* ignore crawl errors; we still have the base pool */ }
+
 
     // resolve details & clean to "games" only
     let metas = (await Promise.all(ids.map(getAppDetails))).filter(Boolean);
