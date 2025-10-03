@@ -1,13 +1,21 @@
 {
-  "name": "steam-guessr-api",
+  "name": "steam",
   "version": "1.0.0",
-  "private": true,
-  "main": "server.js",
-  "engines": { "node": ">=18" },
+  "description": "",
+  "type": "commonjs",
+  "main": "app.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
   "dependencies": {
-    "express": "^4.19.2"
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "jsdom": "^24.0.0"
   }
 }
