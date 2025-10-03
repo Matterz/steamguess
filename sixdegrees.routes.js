@@ -1,10 +1,11 @@
-// server/sixdegrees.routes.js
-// Dependencies: npm i jsdom
+// sixdegrees.routes.js — robust tag -> candidates (with fallback)
+// deps: jsdom (already installed)
+
 const express = require('express');
 const { JSDOM } = require('jsdom');
 
 const router = express.Router();
-const UA = 'SixDegreesSteam/1.0 (+stream)';
+const UA = 'SixDegreesSteam/1.1 (+stream)';
 
 // Use Node 18 global fetch if present; else lazy-load node-fetch
 const fetchAny = typeof fetch === 'function'
@@ -17,7 +18,7 @@ const cache = {
   moreLike: new Map(),  // appid -> [neighbor ids]
 };
 
-// --- helpers ---
+/* ------------ helpers: app details & "more like this" ------------ */
 async function getAppDetails(appid) {
   if (cache.app.has(appid)) return cache.app.get(appid);
   const url = `https://store.steampowered.com/api/appdetails?appids=${appid}&l=english`;
@@ -34,10 +35,27 @@ async function getAppDetails(appid) {
       .concat(d.categories?.map(c => c.description) || [])
       .slice(0, 10),
   };
-  cache.app.set(appid, out);
+  if (out.name) cache.app.set(appid, out);
   return out;
 }
 
+async function moreLike(appid, cap = 12) {
+  if (cache.moreLike.has(appid)) return cache.moreLike.get(appid).slice(0, cap);
+  const url = `https://store.steampowered.com/recommended/morelike/app/${appid}?l=english`;
+  const r = await fetchAny(url, { headers: { 'User-Agent': UA } });
+  const html = await r.text();
+  const dom = new JSDOM(html);
+  const cards = [...dom.window.document.querySelectorAll('.cluster_capsule, a[href*="/app/"]')];
+  const ids = [];
+  for (const el of cards) {
+    const id = el.getAttribute('data-ds-appid') || el.href?.match(/\/app\/(\d+)/)?.[1];
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  cache.moreLike.set(appid, ids);
+  return ids.slice(0, cap);
+}
+
+/* ------------ helpers: tag page + search fallback ------------ */
 async function fetchTagHtml(tag) {
   const key = tag.toLowerCase();
   if (cache.tagHtml.has(key)) return cache.tagHtml.get(key);
@@ -62,40 +80,70 @@ function extractSection(dom, title) {
   return [];
 }
 
+// NEW: fallback using Steam Search JSON (returns HTML snippets)
+// We search by the tag text; not perfect, but reliably returns popular matches
+async function searchByTerm(term, count = 60) {
+  const params = new URLSearchParams({
+    term, // use tag string as a generic query
+    count: String(count),
+    start: '0',
+    supportedlang: 'english',
+    category1: '998',    // games only
+    ndl: '1',
+    sort_by: '_ASC',     // leave unsorted to let Steam decide
+    json: '1',
+  });
+  const url = `https://store.steampowered.com/search/results/?${params.toString()}`;
+  const r = await fetchAny(url, { headers: { 'User-Agent': UA } });
+  const j = await r.json().catch(async () => {
+    // Some edges return text/plain; try to parse
+    const t = await r.text();
+    try { return JSON.parse(t); } catch { return { results_html: '' }; }
+  });
+  const html = j.results_html || '';
+  const dom = new JSDOM(`<div id="wrap">${html}</div>`);
+  const cards = [...dom.window.document.querySelectorAll('#wrap a.search_result_row')];
+  const ids = [];
+  for (const a of cards) {
+    const id = a.getAttribute('data-ds-appid') || a.href?.match(/\/app\/(\d+)/)?.[1];
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
 async function tagCandidates(tag, limit = 10) {
   const html = await fetchTagHtml(tag);
   const dom = new JSDOM(html);
-  const s1 = extractSection(dom, 'New & Trending').slice(0, 4);
-  const s2 = extractSection(dom, 'Top Sellers').slice(0, 3);
-  const s3 = extractSection(dom, 'Top Rated').slice(0, 3);
-  const mix = [...new Set([...s1, ...s2, ...s3])].sort(() => Math.random() - 0.5).slice(0, limit);
-  const games = await Promise.all(mix.map(getAppDetails));
-  return games.filter(g => g && g.name);
-}
 
-async function moreLike(appid, cap = 12) {
-  if (cache.moreLike.has(appid)) return cache.moreLike.get(appid).slice(0, cap);
-  const url = `https://store.steampowered.com/recommended/morelike/app/${appid}?l=english`;
-  const r = await fetchAny(url, { headers: { 'User-Agent': UA } });
-  const html = await r.text();
-  const dom = new JSDOM(html);
-  const cards = [...dom.window.document.querySelectorAll('.cluster_capsule, a[href*="/app/"]')];
-  const ids = [];
-  for (const el of cards) {
-    const id = el.getAttribute('data-ds-appid') || el.href?.match(/\/app\/(\d+)/)?.[1];
-    if (id && !ids.includes(id)) ids.push(id);
+  // Try sections from the tag page first
+  const s1 = extractSection(dom, 'New & Trending').slice(0, 6);
+  const s2 = extractSection(dom, 'Top Sellers').slice(0, 6);
+  const s3 = extractSection(dom, 'Top Rated').slice(0, 6);
+  let ids = [...new Set([...s1, ...s2, ...s3])];
+
+  // FALLBACK: if empty (common for some tags), use search by term
+  if (ids.length === 0) {
+    const found = await searchByTerm(tag, 80);
+    ids = found.slice(0, Math.max(limit, 12)); // keep a decent pool
   }
-  cache.moreLike.set(appid, ids);
-  return ids.slice(0, cap);
+
+  // Shuffle a bit and trim
+  ids.sort(() => Math.random() - 0.5);
+  ids = ids.slice(0, Math.max(limit, 12));
+
+  // Resolve details
+  const games = await Promise.all(ids.map(getAppDetails));
+  // Filter out bad fetches
+  return games.filter(g => g && g.name).slice(0, limit);
 }
 
-// 12 slices for the dual-marker wheel (adjust labels as you like)
+/* ------------ wheel slices (hidden to users) ------------ */
 const TAG_SLICES = [
   'Farming Sim','City Builder','Roguelike','Puzzle','Horror','Souls-like',
   'VR','Racing','Sports','Strategy','Platformer','Life Sim',
 ];
 
-// --- routes ---
+/* ------------------- routes ------------------- */
 router.get('/api/six/slices', (req, res) => {
   res.json({ slices: TAG_SLICES });
 });
@@ -103,9 +151,11 @@ router.get('/api/six/slices', (req, res) => {
 router.get('/api/six/tag', async (req, res) => {
   try {
     const { tag, limit = 10 } = req.query;
+    if (!tag) return res.status(400).json({ error: 'missing_tag' });
     const games = await tagCandidates(tag, +limit);
     res.json({ games });
   } catch (e) {
+    console.error('TAG route error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -116,6 +166,7 @@ router.get('/api/six/similar/:appid', async (req, res) => {
     const games = await Promise.all(ids.slice(0, 10).map(getAppDetails));
     res.json({ games });
   } catch (e) {
+    console.error('SIMILAR route error:', e);
     res.status(500).json({ error: e.message });
   }
 });
