@@ -13,21 +13,28 @@ const fetchAny = typeof fetch === 'function'
 const app = express();
 const root = __dirname;
 
-/* ------------ CORS: allow your Bluehost site ------------- */
-// Set these to your actual site(s); you can use an env var on Render.
-const ALLOWED_ORIGINS = [
-  'https://yourdomain.com',
-  'https://www.yourdomain.com',
+// ---- CORS: allow dev (localhost:3000) and your production site(s) ----
+const cors = require('cors');
+
+// Put your Bluehost domain(s) here
+const PROD_ORIGINS = [
+  'https://keyguessing.com',
+  'https://www.keyguessing.com',
 ];
+
+// Always allow localhost:3000 for dev
+const DEV_ORIGINS = ['http://localhost:3000'];
+
+const ALLOWED_ORIGINS = [...DEV_ORIGINS, ...PROD_ORIGINS];
+
 app.use(cors({
   origin: (origin, cb) => {
-    // allow no-origin (curl, server-to-server) and whitelisted origins
+    // Allow server-to-server/no origin and any whitelisted origin
     if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error('Not allowed by CORS'));
+    return cb(new Error(`CORS blocked: ${origin}`));
   },
   methods: ['GET'],
 }));
-/* --------------------------------------------------------- */
 
 // Serve any local assets you might keep on Render (optional)
 app.use(express.static(root));
@@ -77,3 +84,4 @@ const PORT = process.env.PORT || 5500;
 app.listen(PORT, () => {
   console.log(`Render API listening on http://localhost:${PORT}`);
 });
+
