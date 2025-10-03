@@ -1,11 +1,11 @@
-// sixdegrees.routes.js — robust tag -> candidates (with fallback)
+// sixdegrees.routes.js — robust tag -> candidates with multi-tier fallbacks
 // deps: jsdom
 
 const express = require('express');
 const { JSDOM } = require('jsdom');
 
 const router = express.Router();
-const UA = 'SixDegreesSteam/1.1 (+stream)';
+const UA = 'SixDegreesSteam/1.2 (+stream)';
 
 // Use Node 18 global fetch if present; else lazy-load node-fetch
 const fetchAny = typeof fetch === 'function'
@@ -18,6 +18,7 @@ const cache = {
   moreLike: new Map(),  // appid -> [neighbor ids]
 };
 
+/* --------------------- App + Similar --------------------- */
 async function getAppDetails(appid) {
   if (cache.app.has(appid)) return cache.app.get(appid);
   const url = `https://store.steampowered.com/api/appdetails?appids=${appid}&l=english`;
@@ -54,6 +55,7 @@ async function moreLike(appid, cap = 12) {
   return ids.slice(0, cap);
 }
 
+/* --------------------- Tag page (primary) --------------------- */
 async function fetchTagHtml(tag) {
   const key = tag.toLowerCase();
   if (cache.tagHtml.has(key)) return cache.tagHtml.get(key);
@@ -78,7 +80,11 @@ function extractSection(dom, title) {
   return [];
 }
 
-// Fallback: Steam Search JSON returns HTML snippets we can parse for appids
+/* --------------------- Fallback A: Search JSON --------------------- */
+/**
+ * Steam search returns JSON with `results_html` (server-rendered snippets).
+ * Adding headers like X-Requested-With makes it more reliable.
+ */
 async function searchByTerm(term, count = 80) {
   const params = new URLSearchParams({
     term,
@@ -88,9 +94,18 @@ async function searchByTerm(term, count = 80) {
     category1: '998', // games only
     ndl: '1',
     json: '1',
+    cc: 'US',
+    l: 'english',
   });
   const url = `https://store.steampowered.com/search/results/?${params.toString()}`;
-  const r = await fetchAny(url, { headers: { 'User-Agent': UA } });
+  const r = await fetchAny(url, {
+    headers: {
+      'User-Agent': UA,
+      'Accept': 'application/json, text/javascript, */*; q=0.01',
+      'X-Requested-With': 'XMLHttpRequest',
+      'Referer': `https://store.steampowered.com/search/?term=${encodeURIComponent(term)}`
+    }
+  });
   const j = await r.json().catch(async () => {
     const t = await r.text();
     try { return JSON.parse(t); } catch { return { results_html: '' }; }
@@ -106,27 +121,76 @@ async function searchByTerm(term, count = 80) {
   return ids;
 }
 
-async function tagCandidates(tag, limit = 10) {
-  const html = await fetchTagHtml(tag);
-  const dom = new JSDOM(html);
-
-  const s1 = extractSection(dom, 'New & Trending').slice(0, 6);
-  const s2 = extractSection(dom, 'Top Sellers').slice(0, 6);
-  const s3 = extractSection(dom, 'Top Rated').slice(0, 6);
-  let ids = [...new Set([...s1, ...s2, ...s3])];
-
-  if (ids.length === 0) {
-    const found = await searchByTerm(tag, 80);
-    ids = found.slice(0, Math.max(limit, 12));
+/* --------------------- Fallback B: StoreSearch API --------------------- */
+/**
+ * A simpler JSON API used by the store’s search box.
+ * https://store.steampowered.com/api/storesearch/?term=roguelike&l=english&cc=US
+ */
+async function storeSearch(term, count = 80) {
+  const params = new URLSearchParams({
+    term,
+    l: 'english',
+    cc: 'US',
+  });
+  const url = `https://store.steampowered.com/api/storesearch/?${params.toString()}`;
+  const r = await fetchAny(url, { headers: { 'User-Agent': UA } });
+  const j = await r.json().catch(() => ({}));
+  const items = Array.isArray(j?.items) ? j.items : [];
+  const ids = [];
+  for (const it of items) {
+    const appid = String(it?.id || '').trim();
+    if (appid && !ids.includes(appid)) ids.push(appid);
+    if (ids.length >= count) break;
   }
-
-  ids.sort(() => Math.random() - 0.5);
-  ids = ids.slice(0, Math.max(limit, 12));
-
-  const games = await Promise.all(ids.map(getAppDetails));
-  return games.filter(g => g && g.name).slice(0, limit);
+  return ids;
 }
 
+/* --------------------- Tag -> Candidates --------------------- */
+async function tagCandidates(tag, limit = 10) {
+  // 1) Try tag page sections
+  try {
+    const html = await fetchTagHtml(tag);
+    const dom = new JSDOM(html);
+    const s1 = extractSection(dom, 'New & Trending').slice(0, 6);
+    const s2 = extractSection(dom, 'Top Sellers').slice(0, 6);
+    const s3 = extractSection(dom, 'Top Rated').slice(0, 6);
+    let ids = [...new Set([...s1, ...s2, ...s3])];
+    if (ids.length) {
+      ids.sort(() => Math.random() - 0.5);
+      const games = await Promise.all(ids.slice(0, Math.max(limit, 12)).map(getAppDetails));
+      const clean = games.filter(g => g && g.name).slice(0, limit);
+      if (clean.length) return clean;
+    }
+  } catch (e) {
+    // continue to fallback
+  }
+
+  // 2) Fallback A: Search JSON
+  try {
+    let ids = await searchByTerm(tag, 80);
+    ids = ids.slice(0, Math.max(limit, 12));
+    const games = await Promise.all(ids.map(getAppDetails));
+    const clean = games.filter(g => g && g.name).slice(0, limit);
+    if (clean.length) return clean;
+  } catch (e) {
+    // continue to fallback
+  }
+
+  // 3) Fallback B: StoreSearch API
+  try {
+    let ids = await storeSearch(tag, 80);
+    ids = ids.slice(0, Math.max(limit, 12));
+    const games = await Promise.all(ids.map(getAppDetails));
+    const clean = games.filter(g => g && g.name).slice(0, limit);
+    if (clean.length) return clean;
+  } catch (e) {
+    // give up
+  }
+
+  return []; // no matches
+}
+
+/* --------------------- Slices & Routes --------------------- */
 const TAG_SLICES = [
   'Farming Sim','City Builder','Roguelike','Puzzle','Horror','Souls-like',
   'VR','Racing','Sports','Strategy','Platformer','Life Sim',
