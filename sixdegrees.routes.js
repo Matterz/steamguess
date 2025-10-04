@@ -10,6 +10,15 @@ const UA = 'SixDegreesSteam/1.3 (+stream)';
 const fetchAny = typeof fetch === 'function'
   ? fetch
   : (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+  
+  // ---- timeouts ----
+function fetchWithTimeout(url, opts = {}, ms = 6000) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(new Error('timeout')), ms);
+  const p = fetchAny(url, { ...opts, signal: ctrl.signal });
+  return p.finally(() => clearTimeout(id));
+}
+
 
 /* -------------------- caches -------------------- */
 const cache = {
@@ -75,11 +84,10 @@ async function getAppDetails(appid) {
   return out;
 }
 
-/* -------------------- more like this -------------------- */
-async function moreLikeIds(appid, cap = 200) {
+async function moreLikeIds(appid, cap = 160) {  // was 200
   if (cache.moreLike.has(appid)) return cache.moreLike.get(appid).slice(0, cap);
   const url = `https://store.steampowered.com/recommended/morelike/app/${appid}?l=english`;
-  const r = await fetchAny(url, { headers: { 'User-Agent': UA } });
+  const r = await fetchWithTimeout(url, { headers: { 'User-Agent': UA } }, 6000);
   const html = await r.text();
   const dom = new JSDOM(html);
   const cards = [...dom.window.document.querySelectorAll('.cluster_capsule, a[href*="/app/"]')];
@@ -237,11 +245,12 @@ router.get('/api/six/tag', async (req, res) => {
 /**
  * Similar -> diversified games
  * Query params:
- *   ?exclude=123,456   (appid list to remove — e.g., the chain so far)
+ *   ?exclude=123,456
  *   ?limit=10
- *   ?max_overlap=0.85  (drop items with Jaccard >= max_overlap)
- *   ?prefer_diverse=1  (sort ascending by overlap; default 1)
- *   ?goal=YYYY         (if present in pool, NEVER filter it out; promote to front)
+ *   ?max_overlap=0.85
+ *   ?prefer_diverse=1
+ *   ?goal=YYYY
+ *   ?fast=1            // skip one-hop expansion and be stricter with time budget
  */
 router.get('/api/six/similar/:appid', async (req, res) => {
   try {
@@ -250,87 +259,92 @@ router.get('/api/six/similar/:appid', async (req, res) => {
     const preferDiverse = String(req.query.prefer_diverse || '1') !== '0';
     const maxOverlap = Math.min(0.99, Math.max(0.0, parseFloat(req.query.max_overlap || '0.85')));
     const goalId = req.query.goal ? String(req.query.goal) : null;
+    const fast = String(req.query.fast || '0') === '1';
 
     const exclude = new Set(
       (req.query.exclude || '')
         .split(',')
         .map(s => s.trim())
         .filter(Boolean)
-        .concat(src) // always exclude the source itself
+        .concat(src)
     );
 
-    // source tags
+    // overall time budget for this route
+    const startedAt = Date.now();
+    const BUDGET_MS = fast ? 3500 : 6500;
+
     const srcDetails = await getAppDetails(src);
     const srcTagSet = new Set(srcDetails?.tags || []);
 
-    // fetch a generous pool and lightly expand it (one hop) for variety
-	let ids = await moreLikeIds(src, 200);
+    // base pool
+    let ids = await moreLikeIds(src, fast ? 120 : 160);
 
-	// Add one-hop neighbors from the first few results to diversify the pool
-	try {
-	  const seed = ids.slice(0, 6); // crawl a handful only (cheap)
-	  const hopLists = await Promise.all(seed.map(id => moreLikeIds(id, 60)));
-	  for (const list of hopLists) {
-		for (const id of list) {
-		  if (!ids.includes(id)) ids.push(id);
-		}
-	  }
-	} catch (_) { /* ignore crawl errors; we still have the base pool */ }
-
-
-    // resolve details & clean to "games" only
-    let metas = (await Promise.all(ids.map(getAppDetails))).filter(Boolean);
-
-    // Pull out goal meta if it exists in the pool (and do NOT exclude it)
-    let goalMeta = null;
-    if (goalId) {
-      goalMeta = metas.find(m => String(m.appid) === goalId) || null;
+    // optional: one-hop expansion within budget
+    if (!fast && Date.now() - startedAt < BUDGET_MS - 2500) {
+      try {
+        const seed = ids.slice(0, 5); // crawl a few only
+        const hopLists = await Promise.allSettled(seed.map(id => moreLikeIds(id, 50)));
+        for (const h of hopLists) {
+          if (h.status === 'fulfilled') {
+            for (const id of h.value) if (!ids.includes(id)) ids.push(id);
+          }
+        }
+      } catch {}
     }
 
-    // exclude everything else as requested
+    // resolve details (with per-call timeout)
+    let metas = (await Promise.allSettled(ids.slice(0, fast ? 220 : 300).map(id => getAppDetails(id))))
+      .filter(x => x.status === 'fulfilled' && x.value)
+      .map(x => x.value);
+
+    // keep goal if present
+    let goalMeta = null;
+    if (goalId) goalMeta = metas.find(m => String(m.appid) === goalId) || null;
+
+    // apply excludes
     metas = metas.filter(m => !exclude.has(String(m.appid)));
 
-    // score by tag-diversity
-    const scored = metas.map(m => {
-      const set = new Set(m.tags || []);
-      return { meta: m, overlap: jaccard(srcTagSet, set) };
-    });
+    // score diversity
+    const scored = metas.map(m => ({
+      meta: m,
+      overlap: (()=>{
+        const set = new Set(m.tags || []);
+        // jaccard
+        let inter = 0;
+        for (const x of srcTagSet) if (set.has(x)) inter++;
+        const denom = (srcTagSet.size + set.size - inter) || 1;
+        return inter / denom;
+      })()
+    }));
 
-    // filter ultra-similar — BUT NEVER drop the goal if present
+    // filter ultra-similar, but do not drop goal
     let filtered = scored.filter(x => {
       if (goalMeta && String(x.meta.appid) === String(goalMeta.appid)) return true;
       return x.overlap < maxOverlap;
     });
 
-    // sort for diversity (lower overlap first), keeping goal (if any) at the front later
-    if (preferDiverse) {
-      filtered.sort((a, b) => a.overlap - b.overlap);
-    }
-
-    // convert back to metas
+    if (preferDiverse) filtered.sort((a,b)=> a.overlap - b.overlap);
     let pickFrom = filtered.map(x => x.meta);
 
-    // If goal existed, move it to the very front (and dedup)
     if (goalMeta) {
       pickFrom = [goalMeta, ...pickFrom.filter(m => String(m.appid) !== String(goalMeta.appid))];
     }
 
-    // Last-ditch fallback if filtering was too aggressive
+    // fallback to original metas if we filtered too hard
     if (pickFrom.length < limit) {
-      const pool = metas.map(x => x.meta || x); // original metas (already excluded)
-      for (const m of pool) {
+      for (const m of metas) {
         if (!pickFrom.find(p => String(p.appid) === String(m.appid))) pickFrom.push(m);
         if (pickFrom.length >= limit) break;
       }
     }
 
-    // Dedup by name as a last guard
+    // de-dup by name
     const seenNames = new Set();
     const out = [];
     for (const m of pickFrom) {
-      const key = (m.name || '').toLowerCase().trim();
-      if (!seenNames.has(key)) {
-        seenNames.add(key);
+      const k = (m.name || '').toLowerCase().trim();
+      if (!seenNames.has(k)) {
+        seenNames.add(k);
         out.push(m);
       }
       if (out.length >= limit) break;
@@ -339,7 +353,8 @@ router.get('/api/six/similar/:appid', async (req, res) => {
     res.json({ games: out });
   } catch (e) {
     console.error('SIMILAR route error:', e);
-    res.status(500).json({ error: e.message });
+    // Return a bounded error to the client
+    res.status(504).json({ error: e.message || 'timeout' });
   }
 });
 
