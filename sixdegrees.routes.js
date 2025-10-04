@@ -1,6 +1,3 @@
-// sixdegrees.routes.js — only "game" results + diversified "similar"
-// deps: jsdom
-
 const express = require('express');
 const { JSDOM } = require('jsdom');
 
@@ -11,14 +8,14 @@ const fetchAny = typeof fetch === 'function'
   ? fetch
   : (...args) => import('node-fetch').then(({ default: f }) => f(...args));
   
-  // ---- timeouts ----
+// ---- timeouts ----
 function fetchWithTimeout(url, opts = {}, ms = 6000) {
   const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(new Error('timeout')), ms);
-  const p = fetchAny(url, { ...opts, signal: ctrl.signal });
-  return p.finally(() => clearTimeout(id));
+  const id = setTimeout(() => ctrl.abort(), ms);
+  const p = fetchAny(url, { ...opts, signal: ctrl.signal })
+    .finally(() => clearTimeout(id));
+  return p;
 }
-
 
 /* -------------------- caches -------------------- */
 const cache = {
