@@ -162,6 +162,59 @@ async function searchByTerm(term, count = 80) {
   return ids;
 }
 
+// Search JSON fallback (metas): parse names/images directly from results_html
+async function searchMetasByTerm(term, count = 80) {
+  const params = new URLSearchParams({
+    term,
+    count: String(count),
+    start: '0',
+    supportedlang: 'english',
+    category1: '998', // games only
+    ndl: '1',
+    json: '1',
+    cc: 'US',
+    l: 'english',
+  });
+  const url = `https://store.steampowered.com/search/results/?${params.toString()}`;
+  const r = await fetchAny(url, {
+    headers: {
+      'User-Agent': UA,
+      'Accept': 'application/json, text/javascript, */*; q=0.01',
+      'X-Requested-With': 'XMLHttpRequest',
+      'Referer': `https://store.steampowered.com/search/?term=${encodeURIComponent(term)}`
+    }
+  });
+  const j = await r.json().catch(async () => {
+    const t = await r.text();
+    try { return JSON.parse(t); } catch { return { results_html: '' }; }
+  });
+
+  const html = j.results_html || '';
+  const dom = new JSDOM(`<div id="wrap">${html}</div>`);
+  const cards = [...dom.window.document.querySelectorAll('#wrap a.search_result_row')];
+
+  const metas = [];
+  for (const a of cards) {
+    const appid = a.getAttribute('data-ds-appid') || a.href?.match(/\/app\/(\d+)/)?.[1];
+    if (!appid) continue;
+    const titleEl = a.querySelector('.title');
+    const imgEl = a.querySelector('.search_capsule img');
+    const name = (titleEl?.textContent || '').trim();
+    const header_image = imgEl?.getAttribute('src') || '';
+    // guard: skip empties
+    if (!name) continue;
+    metas.push({
+      appid: String(appid),
+      type: 'game',
+      name,
+      header_image,
+      year: undefined,
+      tags: [], // we don’t need tags for /tag endpoint
+    });
+  }
+  return metas;
+}
+
 // StoreSearch fallback
 async function storeSearch(term, count = 80) {
   const params = new URLSearchParams({ term, l: 'english', cc: 'US' });
@@ -191,31 +244,33 @@ async function tagCandidates(tag, limit = 10) {
       const games = (await Promise.all(ids.map(getAppDetails))).filter(Boolean);
       const clean = games.filter(g => (g.type || 'game') === 'game').slice(0, limit);
       if (clean.length >= limit) return clean;
-      // fall through and top-up
+
+      // top-up from remaining ids
       const have = new Set(clean.map(g => String(g.appid)));
       ids = ids.filter(id => !have.has(String(id)));
       const extra = (await Promise.all(ids.map(getAppDetails))).filter(Boolean);
-      return uniq([...clean, ...extra]).slice(0, limit);
+      const merged = uniq([...clean, ...extra]).filter(g => (g?.type || 'game') === 'game');
+      if (merged.length >= limit) return merged.slice(0, limit);
     }
   } catch {}
 
-  // 2) search fallbacks
+  // 2) search fallbacks — now return metas directly without appdetails
   try {
-    const ids = await searchByTerm(tag, 120);
-    const games = (await Promise.all(ids.map(getAppDetails))).filter(Boolean);
-    const clean = games.filter(g => (g.type || 'game') === 'game').slice(0, limit);
-    if (clean.length >= limit) return clean;
+    const metas = await searchMetasByTerm(tag, 120);
+    if (metas.length >= limit) return metas.slice(0, limit);
   } catch {}
 
   try {
+    // storeSearch gives JSON items with id & tiny image; we’ll format to meta
     const ids = await storeSearch(tag, 120);
     const games = (await Promise.all(ids.map(getAppDetails))).filter(Boolean);
-    const clean = games.filter(g => (g.type || 'game') === 'game').slice(0, limit);
-    return clean;
+    const clean = games.filter(g => (g.type || 'game') === 'game');
+    if (clean.length) return clean.slice(0, limit);
   } catch {}
 
   return [];
 }
+
 
 /* -------------------- routes -------------------- */
 
