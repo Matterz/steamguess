@@ -1,6 +1,3 @@
-// server.js — Render (Node)
-// Serves Steam proxies + Six Degrees API with CORS for your Bluehost site(s)
-
 const express = require('express');
 const cors = require('cors');
 
@@ -26,6 +23,10 @@ app.use(cors({
 
 // Quick health endpoint so Render can mark service healthy fast
 app.get('/health', (_req, res) => res.status(200).send('ok'));
+
+// Quick root so Render (and you) can verify the service immediately
+app.get('/', (_req, res) => res.type('text/plain').send('ok'));
+
 
 // Use Node 18+ global fetch if available; otherwise lazy-load node-fetch
 const fetchAny = typeof fetch === 'function'
